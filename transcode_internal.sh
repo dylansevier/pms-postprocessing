@@ -1,4 +1,5 @@
 #!/bin/bash
+START="$(date +%s)"
 # set -x
 ###############################################################################
 # transcode_internal.sh
@@ -22,22 +23,22 @@ CONST_CODECS_01="/config/Library/Application Support/Plex Media Server/Codecs/"
 # A standard location for the codecs (PMS linux package?)
 CONST_CODECS_02="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Codecs/"
 : "${TRANSCODE:="true"}"	# Perform transcode step, otherwise just copy
-: "${COPYAUDIO:="false"}"	# Simply copy audio track, otherwise transcode
+: "${COPYAUDIO:="true"}"	# Simply copy audio track, otherwise transcode
 							#    audio to AAC
 : "${COMCHAP:="false"}"		# Create chapter marks for commercials (leaves the 
 							#    commercials in -- non-destructive)
 : "${AACRATE:="192"}"		# Kb/s for AAC audio (stereo DPLII downmix)
 : "${PPSRATE:="0.000072"}" 	# WARNING: DO NOT CHANGE - USE VBRMULT INSTEAD
-: "${VBRMULT:="1.0"}"      	# Adjusts average video bitrate ("2.0" == 2X)
+: "${VBRMULT:="2.0"}"      	# Adjusts average video bitrate ("2.0" == 2X)
 : "${TMPFOLDER:="/tmp"}"	# In-process transcoded file
-: "${PPFORMAT:="mp4"}"		# Output format <mkv|mp4> (source file will be
+: "${PPFORMAT:="mkv"}"		# Output format <mkv|mp4> (source file will be
 							#    remuxed to this format if any operations are 
 							#    performed)
 : "${ONLYMPEG2:="false"}"	# Only transcode mpeg2video sources
 : "${FFMPEGLIBS:=""}"	    # User-defined ffmpeg libs (codecs) folder
                             #    Contains (at any depth) libmpeg2video_decoder.so
                             #    I.e., /<...>/Plex Media Server/Codecs/
-: "${LOGLEVEL:="1"}"        # Logging verbosity
+: "${LOGLEVEL:="0"}"        # Logging verbosity
                             #    (0=none, *1=STDOUT msgs, 2=STDOUT+STDERR)
 
 ###############################################################################
@@ -156,21 +157,26 @@ if [[ "${TRANSCODE}" == "true" ]]; then
 		# DEINT      = "" (progressive) or "-vf yadif=0:0:0" or "-vf yadif=0:1:0"
 		# DEINT_CUDA = <same as DEINT with string substitution to use yadif_cuda> 
 		###############################################################################
-		DEINT="$(/usr/lib/plexmediaserver/Plex\ Transcoder -i "${WORKINGFILE}" \
-		-filter:v idet -frames:v 1000 -an -f h264 -y /dev/null 2>&1 \
-		| grep "Multi frame detection:" \
-		| perl -lane 'if (/TFF:\s+(\d+)\s+BFF:\s+(\d+)\s+Progressive:\s+(\d+)/){print "-vf yadif=0:0:0" if ($1>$2 && $1>$3);print "-vf yadif=0:1:0" if ($2>$1 && $2>$3);print "" if ($3>$1 && $3>$2);}' \
-		 > >(tee -a "${LOGFILE}") 2> >(tee -a "${ERRFILE}" >&2))"
-		HWYADIF="hwupload_cuda,yadif_cuda"
-		DEINT_CUDA="${DEINT/yadif/$HWYADIF}"		
+		#DEINT="$(/usr/lib/plexmediaserver/Plex\ Transcoder -i "${WORKINGFILE}" \
+		#-filter:v idet -frames:v 1000 -an -f h264 -y /dev/null 2>&1 \
+		#| grep "Multi frame detection:" \
+		#| perl -lane 'if (/TFF:\s+(\d+)\s+BFF:\s+(\d+)\s+Progressive:\s+(\d+)/){print "-vf yadif=0:0:0" if ($1>$2 && $1>$3);print "-vf yadif=0:1:0" if ($2>$1 && $2>$3);print "DYLAN detected progressive" if ($3>$1 && $3>$2);}' \
+		# > >(tee -a "${LOGFILE}") 2> >(tee -a "${ERRFILE}" >&2))"
+		#HWYADIF="-vf deinterlace_vaapi=mode=bob:rate=field:auto=1"
+		#DEINT_CUDA="$HWYADIF"
+		DEINT="$( echo ${WIDTH} ${HEIGHT} ${FPS} \
+		| perl -lane 'if ($F[2]>50){print ""} elsif ($F[2]<50){print "-vf hwupload,deinterlace_vaapi,scale_vaapi=w=$F[0]:h=$F[1]:format=nv12,hwupload"} else {print "MAJOR ALARM"}')"
+		DEINT_CUDA="$DEINT"
+		echo "$DEINT_CUDA"
+		echo "${FPS}"
 		###############################################################################
 		# Calculate average bitrate based on frame size and frame rate
 		###############################################################################
 		BITRATE="$( echo ${WIDTH} ${HEIGHT} ${FPS} ${PPSRATE} ${VBRMULT} \
 		| perl -lane 'print int($F[0]*$F[1]*$F[2]*$F[3]*$F[4]+0.5);')"
-		BITMAX="$(echo ${BITRATE} | perl -lane 'print ($F[0]*2)')"
-		BUFFER="$(echo ${BITRATE} | perl -lane 'print ($F[0]*3)')"
-
+		BITMAX="$(echo ${BITRATE} | perl -lane 'print ($F[0]*4)')"
+		BUFFER="$(echo ${BITRATE} | perl -lane 'print ($F[0]*6)')"
+		
 		echo "INFO -           Dimensions: ${WIDTH} x ${HEIGHT}" > >(tee -a "${LOGFILE}") 2> >(tee -a "${ERRFILE}" >&2)
 		echo "INFO -            Framerate: ${FPS}" > >(tee -a "${LOGFILE}") 2> >(tee -a "${ERRFILE}" >&2)
 		echo "INFO -  De-interlace filter: \"${DEINT}\"" > >(tee -a "${LOGFILE}") 2> >(tee -a "${ERRFILE}" >&2)
@@ -191,9 +197,10 @@ if [[ "${TRANSCODE}" == "true" ]]; then
 		 | tee -a "${LOGFILE}" "${ERRFILE}"
 		TEMPFILENAME="$(mktemp ${TMPFOLDER}/transcode.XXXXXXXX.mkv)"  # Temporary File Name for transcoding
 		/usr/lib/plexmediaserver/Plex\ Transcoder -y -hide_banner \
-		-hwaccel nvdec -i "${WORKINGFILE}" \
-		-c:v h264_nvenc -b:v ${BITRATE}k -maxrate:v ${BITMAX}k -profile:v high \
-		-bf:v 3 -bufsize:v ${BUFFER}k -preset:v hq -forced-idr:v 1 ${DEINT_CUDA} \
+		-hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device vaapi -i "${WORKINGFILE}" \
+		-c:v hevc_vaapi -b:v ${BITRATE}k -maxrate:v ${BITMAX}k -bufsize:v 31250k -idr_interval:v 1 \
+		-bf:v 3 $DEINT \
+		-init_hw_device vaapi=vaapi: -filter_hw_device vaapi \
 		${AUDIOPARMS} \
 		"${TEMPFILENAME}" > >(tee -a "${LOGFILE}") 2> >(tee -a "${ERRFILE}" >&2)
 		ERRCODE=$?
@@ -289,7 +296,7 @@ if [[ "${COMSKIP_CHAPTERS}" != "" || "$(stat -c%s "${WORKINGFILE}")" -ne "${WORK
 		#    due to limitations of the container
 		/usr/lib/plexmediaserver/Plex\ Transcoder -y -hide_banner \
 		   -i "$WORKINGFILE" \
-		 -c:v copy -c:a copy -c:s copy -c:d copy -c:t copy \
+		 -c:v copy -c:a copy -c:s copy -c:d copy -c:t copy -movflags +faststart \
 		   "$TEMPFILENAME"  > >(tee -a "${LOGFILE}") 2> >(tee -a "${ERRFILE}" >&2)
    fi
    ERRCODE=$?
@@ -315,6 +322,26 @@ else
    echo "$(date +"%Y%m%d-%H%M%S") [${UNIQUESTRING}] INFO: transcode_internal.sh : Postprocessing completed. No work done. Removed ${WORKINGFILE}." \
 		| tee -a "${LOGFILE}"
 fi
+DURATION=$[ $(date +%s) - ${START} ]
+echo -e "\n
+\n
+\n
+\n
+\n
+\n
+\n
+${FILENAME}
+"
+echo 'Transcode Completed In:' 
+awk -v t=$DURATION 'BEGIN{t=int(t*1000); printf "%d:%02d:%02d\n", t/3600000, t/60000%60, t/1000%60}'
+echo -e "\n
+\n
+\n
+\n
+\n
+\n
+\n
+"
 rm -f "${WORKINGFILE}"
 rm -f "${TMPFOLDER}/${COMSKIP_PRE}.comskip"*
 exit 0
